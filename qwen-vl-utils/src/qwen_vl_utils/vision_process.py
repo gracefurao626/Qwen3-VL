@@ -19,6 +19,7 @@ from PIL import Image
 import numpy as np
 from torchvision import io, transforms
 from torchvision.transforms import InterpolationMode
+import torchaudio
 
 
 MAX_RATIO = 200
@@ -479,7 +480,34 @@ def fetch_video(ele: Dict[str, Any], image_patch_size: int = 14, return_video_sa
         return final_video, sample_fps
     return final_video
 
+def fetch_audio(ele: Dict[str, Any], target_sr: int = 16000) -> Tuple[np.ndarray, int]:
+    
+    audio_data = ele.get("audio", ele)
+    
+    if isinstance(audio_data, dict) and "bytes" in audio_data:
+        waveform, sample_rate = torchaudio.load(BytesIO(audio_data["bytes"]))
+    elif isinstance(audio_data, bytes):
+        waveform, sample_rate = torchaudio.load(BytesIO(audio_data))
+    else:
+        raise ValueError(f"Unrecognized audio input, got {type(audio_data)}")
+    
+    # waveform: (channels, num_samples)
+    # convert waveform to float32 to ensure resampling operates in float32
+    waveform = waveform.to(dtype=torch.float32)
 
+    # Convert to mono (Whisper expects mono audio input)
+    if waveform.ndim == 2 and waveform.size(0) > 1:
+        waveform = waveform.mean(dim=0, keepdim=True)
+
+    # Resample if needed
+    if sample_rate != target_sr:
+        waveform = torchaudio.functional.resample(waveform, sample_rate, target_sr)
+        sample_rate = target_sr
+
+    # Return 1D float32 numpy array
+    waveform_1d = waveform.squeeze(0).contiguous().cpu().numpy().astype(np.float32)
+    return waveform_1d, sample_rate
+    
 def extract_vision_info(conversations: Union[List[Dict[str, Any]], List[List[Dict[str, Any]]]]) -> List[Dict[str, Any]]:
     vision_infos = []
     if isinstance(conversations[0], dict):
@@ -492,7 +520,8 @@ def extract_vision_info(conversations: Union[List[Dict[str, Any]], List[List[Dic
                         "image" in ele
                         or "image_url" in ele
                         or "video" in ele
-                        or ele.get("type", "text") in ("image", "image_url", "video")
+                        or "audio" in ele
+                        or ele.get("type", "text") in ("image", "image_url", "video", "audio")
                     ):
                         vision_infos.append(ele)
     return vision_infos
@@ -503,13 +532,15 @@ def process_vision_info(
     return_video_kwargs: bool = False,
     return_video_metadata: bool = False,
     image_patch_size: int = 14,
-) -> Tuple[Optional[List[Image.Image]], Optional[List[Union[torch.Tensor, List[Image.Image]]]], Optional[Dict[str, Any]]]:
+    target_sr: int = 16000,
+) -> Tuple[Optional[List[Image.Image]], Optional[List[np.ndarray]], Optional[List[Union[torch.Tensor, List[Image.Image]]]], Optional[Dict[str, Any]]]:
 
     vision_infos = extract_vision_info(conversations)
     ## Read images or videos
     image_inputs = []
     video_inputs = []
     video_sample_fps_list = []
+    audio_inputs = []
     for vision_info in vision_infos:
         if "image" in vision_info or "image_url" in vision_info:
             image_inputs.append(fetch_image(vision_info, image_patch_size=image_patch_size))
@@ -518,17 +549,23 @@ def process_vision_info(
                         image_patch_size=image_patch_size, return_video_metadata=return_video_metadata)
             video_sample_fps_list.append(video_sample_fps)
             video_inputs.append(video_input)
+        elif "audio" in vision_info:
+            # The sample rate is constant and doesn't need to be tracked per sample
+            audio_waveform, _ = fetch_audio(vision_info, target_sr=target_sr)
+            audio_inputs.append(audio_waveform)
         else:
-            raise ValueError("image, image_url or video should in content.")
+            raise ValueError("image, image_url, video or audio should in content.")
     if len(image_inputs) == 0:
         image_inputs = None
     if len(video_inputs) == 0:
         video_inputs = None
+    if len(audio_inputs) == 0:
+        audio_inputs = None
 
     video_kwargs = {'do_sample_frames': False}
     if not return_video_metadata: # BC for qwen2.5vl
         video_kwargs.update({'fps': video_sample_fps_list})
 
     if return_video_kwargs:
-        return image_inputs, video_inputs, video_kwargs
-    return image_inputs, video_inputs
+        return image_inputs, audio_inputs, video_inputs, video_kwargs
+    return image_inputs, audio_inputs, video_inputs
